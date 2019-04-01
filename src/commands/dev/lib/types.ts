@@ -1,8 +1,7 @@
 import http from 'http';
+import { Output } from '../../../util/output';
 import { Lambda as FunLambda } from '@zeit/fun';
 import { FileBlob, FileFsRef, Lambda } from '@now/build-utils';
-import { Output } from '../../../util/output';
-import { NowContext } from '../../../types';
 
 export enum DevServerStatus {
   busy,
@@ -15,13 +14,7 @@ export interface DevServerOptions {
 }
 
 export interface EnvConfig {
-  [name: string]: string;
-}
-
-export interface DevWatcherOptions {
-  ctx: NowContext;
-  debug: boolean;
-  output: Output;
+  [name: string]: string | undefined;
 }
 
 export interface BuildConfig {
