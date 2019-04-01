@@ -28,8 +28,8 @@ export default async function dev(
   const cloud = Boolean(opts['-c'] || opts['--cloud']);
 
   if (cloud) {
-    const devWatcher = new DevWatcher(cwd, { ctx, debug, output });
-    await devWatcher.start();
+    const devWatcher = new DevWatcher(cwd, { debug, output });
+    process.once('SIGINT', devWatcher.stop.bind(devWatcher));
   } else {
     const devServer = new DevServer(cwd, { output });
     process.once('SIGINT', devServer.stop.bind(devServer));

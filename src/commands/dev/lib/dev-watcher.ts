@@ -1,103 +1,132 @@
-import fs from 'fs';
 import path from 'path';
-import chalk from 'chalk';
 import chokidar from 'chokidar';
-import throttle from 'lodash.throttle';
 import WebSocket from 'ws';
 
-import { initWebsocket } from './dev-ws';
-import getUser from '../../../util/get-user';
-import Client from '../../../util/client';
-
-import wait from '../../../util/output/wait';
-
+import hash from './hash';
+import { readFileBase64 } from './fs-helper';
+import { Output } from '../../../util/output';
 import IGNORED from '../../../util/ignored';
 
-import { Output } from '../../../util/output';
-import { NowContext } from '../../../types';
-import { DevWatcherOptions } from './types';
+export enum ServerEvent {
+  MISSING_FILE = 'MISSING_FILE'
+}
 
-export default class devWatcher {
+export enum ClientEvent {
+  FS_CHANGE = 'FS_CHANGE',
+  UPDATE_FILE = 'UPDATE_FILE'
+}
+
+interface WebSocketError extends Error {
+  code?: string;
+}
+
+interface DevWatcherOptions {
+  debug: boolean;
+  output: Output;
+}
+
+export default class DevWatcher {
   private cwd: string;
-  private ctx: NowContext;
   private output: Output;
-  private watcher: chokidar.FSWatcher;
-  private websocket: WebSocket;
-  private devURL: string = '';
+  private remote?: string;
+  private devSocket?: WebSocket;
+  private fsWatcher?: chokidar.FSWatcher;
+  private reconnTimeout?: NodeJS.Timer;
 
   constructor (cwd: string, options: DevWatcherOptions) {
     this.cwd = cwd;
-    this.ctx = options.ctx;
     this.output = options.output;
-    this.websocket = initWebsocket('http://localhost:3000/_now/ws');
+    this.connect();
 
-    this.watcher = chokidar.watch(this.cwd, {
-      ignored: createIgnoredList(this.cwd),
-      ignoreInitial: true
+    process.once('SIGINT', this.stop);
+  }
+
+  private connect = async () => {
+    this.remote = this.spinDevWorker();
+
+    this.output.debug(`CONNECT ${new Date}`);
+
+    const wss = new WebSocket(this.remote);
+    wss.on('open', this.onWebsocketOpen);
+    wss.on('message', this.onWebsocketMessage);
+    wss.on('error', this.onWebsocketError);
+
+    this.devSocket = wss;
+  }
+
+  spinDevWorker = (): string => {
+    this.output.debug('TODO: spin dev-worker');
+    return 'http://localhost:3000'
+  }
+
+  private onWebsocketOpen = () => {
+    this.fsWatcher = this.startWatcher();
+  }
+
+  private startWatcher = () => {
+    const watcher = chokidar.watch(this.cwd, {
+      ignored: IGNORED
     });
-    this.watcher.on('all', this.onFsChange);
+    watcher.on('add', this.onFsChange('add'));
+    watcher.on('change', this.onFsChange('change'));
+    watcher.on('unlink', this.onFsChange('unlink'));
 
-    process.on('SIGINT', this.onQuit);
+    return watcher;
   }
 
-  start = async () => {
-    await this.generateDevURL();
-    this.output.log(`Your dev url is ${chalk.bold(this.devURL)}`);
-
-    // first deployment
-    await this.deploy();
-  };
-
-  onFsChange = (event: NodeJS.Events, _path: string) => {
-    this.output.debug(`${event}: ${_path}`);
-    this.deploy();
-  };
-
-  onQuit = () => {
-    this.watcher.close();
-    this.websocket.close(1000);
-    console.log('stop dev-worker');
-  };
-
-  deploy = throttle(async () => {
-    // TODO: verify project before do deployment
-    console.time('> deployed');
-
-    // TODO: collect files, verify files, send de
-    this.websocket.send('NDC: Send files to dev-worker');
-
-    console.timeEnd('> deployed');
-  }, 3000);
-
-  generateDevURL = async () => {
-    const { apiUrl, authConfig } = this.ctx;
-    const { token } = authConfig;
-
-    const stopUserSpinner = wait('Fetching user information');
-    const client = new Client({ apiUrl, token });
-    const user = await getUser(client);
-
-    stopUserSpinner();
-
-    this.devURL = `project-name-dev-${user.username}.now.sh`;
-  }
-}
-
-function createIgnoredList (cwd: string) {
-  const gitignore = readAsText(cwd, '.gitignore');
-  const nowignore = readAsText(cwd, '.nowignore');
-  return [
-    IGNORED,
-    gitignore,
-    nowignore
-  ].join('\n').split('\n').filter(Boolean);
-}
-
-function readAsText (cwd: string, filename: string) {
-  const fsPath = path.join(cwd, filename);
-  if (fs.existsSync(fsPath) && fs.statSync(fsPath).isFile()) {
-    return fs.readFileSync(fsPath, 'utf8');
+  private onWebsocketMessage = async (message: string) => {
+    const [event, data] = JSON.parse(message);
+    switch (event) {
+      case ServerEvent.MISSING_FILE:
+        return this.sendFile(data.file);
+      default:
+        this.output.log(`WS_MSG ${event} ${data}`);
+    }
   }
 
-  return ''
+  private sendFile = async (file: string) => {
+    const base64 = await readFileBase64(this.cwd, file);
+    this.emit(ClientEvent.UPDATE_FILE, { file, base64 });
+  }
+
+  private onWebsocketError = (err: WebSocketError) => {
+    switch (err.code) {
+      case 'ECONNREFUSED':
+        this.reconnTimeout = setTimeout(this.connect, 1000);
+        return;
+      default:
+        this.output.debug(`WS_ERR ${err}`);
+    }
+  }
+
+  private onFsChange = (event: string) => async (_path: string) => {
+    let sha1;
+
+    if (event !== 'unlink') {
+      sha1 = await hash(_path);
+    }
+
+    const file = path.relative(this.cwd, _path);
+    const data = { event, file, sha1 };
+
+    console.log(ClientEvent.FS_CHANGE, event, file);
+    this.emit(ClientEvent.FS_CHANGE, data);
+  };
+
+  private emit = (event: string, data: object) => {
+    if (!this.devSocket) return;
+
+    const message = JSON.stringify([event, data]);
+    return this.devSocket.send(message, err => {
+      if (err) {
+        console.error(err, event, data);
+      }
+    });
+  }
+
+  public stop = () => {
+    if (this.fsWatcher) this.fsWatcher.close();
+    if (this.devSocket) this.devSocket.close(1000);
+    if (this.reconnTimeout) clearTimeout(this.reconnTimeout);
+  }
 }
