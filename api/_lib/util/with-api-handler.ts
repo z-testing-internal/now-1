@@ -17,9 +17,9 @@ export function withApiHandler(handler: Handler): Handler {
     }
 
     if (req.method !== 'GET') {
-      return res.status(405).json({
+      return res.status(404).json({
         error: {
-          code: 'method_not_allowed',
+          code: 'not-found',
           message: 'Only GET requests are supported for this endpoint.',
         },
       });
